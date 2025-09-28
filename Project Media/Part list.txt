@@ -1,0 +1,3 @@
+Tools: 3d printer (centauri carbon), Soldering Iron, Paint Brush
+General Materials: 3d filament, green paint, super glue, electrical tape
+Project Specific: Arduino nano,RFID Sensor, RFID Chip, Mini Speaker, DFplayer mini, LED Strip, Breadboard, Jumper Wires

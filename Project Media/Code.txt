@@ -1,0 +1,290 @@
+// === RFID Green Lantern Project (fixed presence) ===
+// - Tag near: fade IN, breathing loop, play /01/001.mp3 ONCE (vol 30)
+// - Tag stays: audio keeps playing (no restart)
+// - Tag leaves: stop audio immediately, fade OUT
+//
+// Wiring:
+// MFRC522: SDA->D10, RST->D9, SCK->D13, MOSI->D11, MISO->D12, 3.3V, GND
+// DFPlayer: DF TX->D6, D5->(1k series + 2k to GND)->DF RX, 5V, GND
+// Speaker: SPK+ / SPK- (neither to GND)
+// LED: D3 (PWM) -> resistor -> LED -> GND  (set LED_ACTIVE_HIGH=1; set to 0 if sinking)
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+
+// -------------------- PIN MAP --------------------
+#define RFID_RST_PIN    9
+#define RFID_SS_PIN     10
+#define LED_PIN         3
+#define LED_ACTIVE_HIGH 1
+
+static const uint8_t DF_RX_TO_ARD   = 6;  // DF TX -> Nano D6
+static const uint8_t DF_TX_FROM_ARD = 5;  // Nano D5 -> divider -> DF RX
+
+// -------------------- OBJECTS --------------------
+MFRC522 mfrc522(RFID_SS_PIN, RFID_RST_PIN);
+SoftwareSerial mp3Serial(DF_RX_TO_ARD, DF_TX_FROM_ARD);
+DFRobotDFPlayerMini player;
+
+// -------------------- TIMING --------------------
+const uint16_t FADE_IN_MS        = 2000;
+const uint16_t FADE_OUT_MS       = 1500;
+const uint16_t CHARGE_PERIOD_MS  = 3000;
+const uint8_t  CHARGE_MIN_BRIGHT = 80;
+const uint8_t  CHARGE_MAX_BRIGHT = 255;
+const uint16_t ABSENCE_TIMEOUT   = 800;   // ms after last read to call it "gone"
+
+// -------------------- STATE --------------------
+enum State { IDLE, FADING_IN, CHARGING, FADING_OUT };
+State state = IDLE;
+
+uint32_t stateStartMs   = 0;
+uint32_t lastSeenMs     = 0;
+uint8_t  currentBright  = 0;
+bool     wasPresent     = false;
+bool     audioPlayedThisPresence = false;
+uint8_t  fadeOutStartBright = 0;
+
+// -------------------- HELPERS --------------------
+static inline uint8_t clampU8(int v) {
+  return (v < 0) ? 0 : (v > 255) ? 255 : (uint8_t)v;
+}
+
+void setLed(uint8_t brightness) {
+  analogWrite(LED_PIN, LED_ACTIVE_HIGH ? brightness : (255 - brightness));
+  currentBright = brightness;
+  // DEBUG
+  Serial.print(F("[LED] millis=")); Serial.print(millis());
+  Serial.print(F(" setLed -> ")); Serial.println(currentBright);
+}
+
+void startState(State s) {
+  // DEBUG
+  Serial.print(F("[STATE] millis=")); Serial.print(millis());
+  Serial.print(F(" ")); 
+  switch(state){
+    case IDLE:       Serial.print(F("IDLE")); break;
+    case FADING_IN:  Serial.print(F("FADING_IN")); break;
+    case CHARGING:   Serial.print(F("CHARGING")); break;
+    case FADING_OUT: Serial.print(F("FADING_OUT")); break;
+  }
+  Serial.print(F(" -> "));
+  switch(s){
+    case IDLE:       Serial.println(F("IDLE")); break;
+    case FADING_IN:  Serial.println(F("FADING_IN")); break;
+    case CHARGING:   Serial.println(F("CHARGING")); break;
+    case FADING_OUT: Serial.println(F("FADING_OUT")); break;
+  }
+
+  state = s;
+  stateStartMs = millis();
+  if (s == FADING_OUT) fadeOutStartBright = currentBright;
+}
+
+uint8_t sineWave(uint32_t now, uint16_t periodMs, uint8_t a, uint8_t b) {
+  float t = (now % periodMs) / (float)periodMs;
+  float val = (sin(t * TWO_PI - HALF_PI) + 1.0f) * 0.5f; // 0..1
+  return clampU8(a + (uint8_t)((b - a) * val));
+}
+
+void stopAudio() {
+  // DEBUG
+  Serial.print(F("[AUDIO] millis=")); Serial.print(millis());
+  Serial.println(F(" stopAudio()"));
+  player.stop();
+  delay(10);
+}
+
+void tryPlayOnce() {
+  if (!audioPlayedThisPresence) {
+    // DEBUG
+    Serial.print(F("[AUDIO] millis=")); Serial.print(millis());
+    Serial.println(F(" play once: /01/001.mp3 vol=30"));
+    player.volume(30);        // 🔊 max
+    delay(10);
+    player.playFolder(1, 1);  // expects /01/001.mp3
+    delay(20);
+    audioPlayedThisPresence = true;
+  } else {
+    // DEBUG
+    Serial.print(F("[AUDIO] millis=")); Serial.print(millis());
+    Serial.println(F(" already played this presence; skip"));
+  }
+}
+
+// -------- FIXED PRESENCE: don't halt while card is near --------
+// We update lastSeenMs whenever we can read a UID. We DO NOT call HaltA/StopCrypto1
+// while present; we only do that when we detect absence. This keeps presence "sticky".
+bool checkCardPresent() {
+  bool readable = false;
+
+  if (mfrc522.PICC_IsNewCardPresent()) {
+    if (mfrc522.PICC_ReadCardSerial()) {
+      readable = true;
+    }
+  } else {
+    // Many readers still allow re-reads of the same card without "new"
+    if (mfrc522.PICC_ReadCardSerial()) {
+      readable = true;
+    }
+  }
+
+  uint32_t now = millis();
+
+  if (readable) {
+    lastSeenMs = now;
+
+    // DEBUG: print UID
+    Serial.print(F("[RFID] millis=")); Serial.print(now);
+    Serial.print(F(" UID="));
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+      if (mfrc522.uid.uidByte[i] < 0x10) Serial.print('0');
+      Serial.print(mfrc522.uid.uidByte[i], HEX);
+      if (i < mfrc522.uid.size - 1) Serial.print(':');
+    }
+    Serial.println();
+  }
+
+  bool present = (now - lastSeenMs) <= ABSENCE_TIMEOUT;
+
+  // Only log changes to reduce spam
+  static bool lastReported = false;
+  if (present != lastReported) {
+    Serial.print(F("[RFID] millis=")); Serial.print(now);
+    Serial.print(F(" present=")); Serial.println(present ? F("true") : F("false"));
+    lastReported = present;
+  }
+
+  // Edge: just left
+  if (wasPresent && !present) {
+    // Now that it's gone, properly close the session and stop audio
+    Serial.print(F("[RFID] millis=")); Serial.print(now);
+    Serial.println(F(" edge: LEFT -> HaltA + StopCrypto1 + stopAudio"));
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+    stopAudio();
+    audioPlayedThisPresence = false; // allow replay on next presence
+  }
+
+  wasPresent = present;
+  return present;
+}
+
+// -------------------- ANIMATION --------------------
+void updateAnimation() {
+  uint32_t now = millis();
+  bool present = checkCardPresent();
+
+  switch (state) {
+    case IDLE:
+      if (present) {
+        Serial.print(F("[ANIM] millis=")); Serial.print(now);
+        Serial.println(F(" IDLE->FADING_IN (presence)"));
+        startState(FADING_IN);
+        tryPlayOnce();        // play once at start of presence
+      } else {
+        setLed(0);
+      }
+      break;
+
+    case FADING_IN: {
+      if (!present) { 
+        Serial.print(F("[ANIM] millis=")); Serial.print(now);
+        Serial.println(F(" FADING_IN->FADING_OUT (lost presence)"));
+        startState(FADING_OUT); 
+        break; 
+      }
+      uint32_t dt = now - stateStartMs;
+      if (dt >= FADE_IN_MS) {
+        setLed(255);
+        Serial.print(F("[ANIM] millis=")); Serial.print(now);
+        Serial.println(F(" FADING_IN complete -> CHARGING"));
+        startState(CHARGING);
+      } else {
+        int b = (int)((dt * 255UL) / FADE_IN_MS);
+        setLed(clampU8(b));
+      }
+    } break;
+
+    case CHARGING:
+      if (!present) {
+        Serial.print(F("[ANIM] millis=")); Serial.print(now);
+        Serial.println(F(" CHARGING->FADING_OUT (lost presence)"));
+        startState(FADING_OUT);
+      } else {
+        uint8_t b = sineWave(now, CHARGE_PERIOD_MS, CHARGE_MIN_BRIGHT, CHARGE_MAX_BRIGHT);
+        setLed(b);
+        // Do not restart audio if it finishes naturally; one-shot per presence.
+      }
+      break;
+
+    case FADING_OUT: {
+      if (present) {        // Came back mid-fade -> restart cycle + audio if not yet played
+        Serial.print(F("[ANIM] millis=")); Serial.print(now);
+        Serial.println(F(" FADING_OUT->FADING_IN (presence returned mid-fade)"));
+        startState(FADING_IN);
+        tryPlayOnce();
+        break;
+      }
+      uint32_t dt = now - stateStartMs;
+      if (dt >= FADE_OUT_MS) {
+        setLed(0);
+        Serial.print(F("[ANIM] millis=")); Serial.print(now);
+        Serial.println(F(" FADING_OUT complete -> IDLE"));
+        startState(IDLE);
+      } else {
+        int b = (int)fadeOutStartBright - (int)((dt * fadeOutStartBright) / FADE_OUT_MS);
+        setLed(clampU8(b));
+      }
+    } break;
+  }
+}
+
+// -------------------- SETUP/LOOP --------------------
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  setLed(0);
+
+  Serial.begin(115200);
+  delay(80);
+  Serial.println();
+  Serial.println(F("=== Green Lantern Debug Build ==="));
+  Serial.print(F("[BOOT] LED_ACTIVE_HIGH=")); Serial.println(LED_ACTIVE_HIGH);
+  Serial.print(F("[BOOT] DF RX->D")); Serial.print(DF_RX_TO_ARD);
+  Serial.print(F("  DF TX<-D")); Serial.println(DF_TX_FROM_ARD);
+
+  // RFID
+  SPI.begin();
+  mfrc522.PCD_Init();
+  Serial.println(F("[BOOT] MFRC522 initialized"));
+
+  // DFPlayer
+  Serial.println(F("[BOOT] Initializing DFPlayer..."));
+  mp3Serial.begin(9600);
+  delay(500);
+
+  bool ok = false;
+  for (int i = 0; i < 5 && !ok; i++) {
+    Serial.print(F("[BOOT] DFPlayer begin attempt ")); Serial.println(i + 1);
+    mp3Serial.listen();
+    ok = player.begin(mp3Serial);
+    Serial.print(F("[BOOT] DFPlayer begin result=")); Serial.println(ok ? F("OK") : F("FAIL"));
+    if (!ok) delay(300);
+  }
+  if (ok) {
+    player.EQ(DFPLAYER_EQ_NORMAL);
+    player.volume(30); // 🔊 default max
+    Serial.println(F("[BOOT] DFPlayer configured (EQ=NORMAL, vol=30)"));
+  } else {
+    Serial.println(F("[BOOT] DFPlayer not responding. Check wiring, power, divider."));
+  }
+
+  startState(IDLE);
+  Serial.println(F("[BOOT] Entering loop..."));
+}
+
+void loop() {
+  updateAnimation();
+}
